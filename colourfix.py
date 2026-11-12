@@ -10,7 +10,7 @@ every monitor is corrected, not just one app.
     Linux   : X11  -> per-output CTM property (kernel/GPU colour matrix)
               KDE Plasma 6 Wayland -> KWin's colour blindness correction effect
 
-Run with no arguments for the window, or from a terminal:
+Run with no arguments for the app window, or from a terminal:
 
     python colourfix.py --type deutan --strength 0.8
     python colourfix.py --type protan --simulate      (show others what you see)
@@ -24,6 +24,7 @@ import argparse
 import atexit
 import ctypes
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -430,78 +431,449 @@ def get_backend():
 
 
 # --------------------------------------------------------------------------
+# Settings and start-at-login
+# --------------------------------------------------------------------------
+
+DEFAULTS = {"kind": "deutan", "mode": "correct", "strength": 0.8,
+            "auto_on": False}
+
+
+def config_dir():
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif system == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP)
+
+
+def load_settings():
+    settings = dict(DEFAULTS)
+    try:
+        with open(os.path.join(config_dir(), "settings.json")) as f:
+            saved = json.load(f)
+        for key, default in DEFAULTS.items():
+            if isinstance(saved.get(key), type(default)):
+                settings[key] = saved[key]
+    except (OSError, ValueError):
+        pass
+    if settings["kind"] not in SIMULATE:
+        settings["kind"] = DEFAULTS["kind"]
+    if settings["mode"] not in ("correct", "simulate"):
+        settings["mode"] = DEFAULTS["mode"]
+    settings["strength"] = max(0.0, min(1.0, settings["strength"]))
+    return settings
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(config_dir(), exist_ok=True)
+        with open(os.path.join(config_dir(), "settings.json"), "w") as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass
+
+
+def launch_command():
+    if getattr(sys, "frozen", False):                  # packaged app
+        return [sys.executable, "--minimised"]
+    return [sys.executable, os.path.abspath(__file__), "--minimised"]
+
+
+def _autostart_file():
+    if platform.system() == "Darwin":
+        return os.path.expanduser("~/Library/LaunchAgents/com.colourfix.app.plist")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "autostart", "colourfix.desktop")
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_enabled():
+    if platform.system() == "Windows":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                winreg.QueryValueEx(key, APP)
+            return True
+        except OSError:
+            return False
+    return os.path.exists(_autostart_file())
+
+
+def set_autostart(on):
+    cmd = launch_command()
+    if platform.system() == "Windows":
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if on:
+                winreg.SetValueEx(key, APP, 0, winreg.REG_SZ,
+                                  " ".join('"%s"' % c for c in cmd))
+            else:
+                try:
+                    winreg.DeleteValue(key, APP)
+                except OSError:
+                    pass
+        return
+    path = _autostart_file()
+    if not on:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if platform.system() == "Darwin":
+        import plistlib
+        with open(path, "wb") as f:
+            plistlib.dump({"Label": "com.colourfix.app",
+                           "ProgramArguments": cmd, "RunAtLoad": True}, f)
+    else:
+        with open(path, "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=%s\nExec=%s\n"
+                    "X-GNOME-Autostart-enabled=true\n"
+                    % (APP, " ".join('"%s"' % c for c in cmd)))
+
+
+# --------------------------------------------------------------------------
 # Window
 # --------------------------------------------------------------------------
 
-def run_gui(backend):
-    import tkinter as tk
-    from tkinter import ttk, messagebox
+BG, PANEL, INK = "#eef1f6", "#ffffff", "#18203a"
+MUTED, LINE, ACCENT, HILITE = "#5d667d", "#d5dae5", "#2350e0", "#ffc533"
+OFF_TRACK, SOFT = "#c3cad8", "#c5cbe0"
 
-    root = tk.Tk()
-    root.title(APP)
-    root.resizable(False, False)
-    frame = ttk.Frame(root, padding=16)
-    frame.grid()
+SWATCHES = ["#d6362b", "#3f9b3a", "#e98a1f", "#9c9a2a", "#7a4a21",
+            "#2f6b3c", "#e37fa5", "#8f97a3", "#7b3fb0", "#2f5fd0"]
 
-    kind = tk.StringVar(value="deutan")
-    mode = tk.StringVar(value="correct")
-    strength = tk.DoubleVar(value=0.8)
-    enabled = tk.BooleanVar(value=False)
-    status = tk.StringVar(value="Off")
+CARDS = [("protan", "Protan", "Red-weak"),
+         ("deutan", "Deutan", "Green-weak"),
+         ("tritan", "Tritan", "Blue-weak")]
 
-    def refresh(*_):
+
+def preview_hex(colour, m):
+    """What a swatch looks like once the matrix has been applied."""
+    lin = []
+    for n in (1, 3, 5):
+        v = int(colour[n:n + 2], 16) / 255.0
+        lin.append(v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4)
+    out = "#"
+    for row in m:
+        v = max(0.0, min(1.0, sum(row[k] * lin[k] for k in range(3))))
+        v = 12.92 * v if v <= 0.0031308 else 1.055 * v ** (1 / 2.4) - 0.055
+        out += "%02x" % int(round(v * 255))
+    return out
+
+
+def start_windows_hotkey(flag):
+    """Ctrl+Alt+C from anywhere. Sets flag['hit']; the window polls it."""
+    import threading
+    from ctypes import wintypes
+
+    def listen():
+        user32 = ctypes.windll.user32
+        if not user32.RegisterHotKey(None, 1, 0x0001 | 0x0002, 0x43):
+            return
+        flag["ready"] = True
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == 0x0312:                  # WM_HOTKEY
+                flag["hit"] = True
+
+    threading.Thread(target=listen, daemon=True).start()
+
+
+class AppWindow:
+    W, H, PAD = 480, 618, 24
+
+    def __init__(self, backend, backend_error=None, minimised=False):
+        import tkinter as tk
+        self.tk = tk
+        self.backend, self.backend_error = backend, backend_error
+        self.settings = load_settings()
+        self.enabled = False
+        self.error = None
+        self.hits, self.job, self.dragging = [], None, False
+        self.hotkey = {"hit": False, "ready": False}
         try:
-            if enabled.get():
-                sim = mode.get() == "simulate"
-                m = build_matrix(kind.get(), strength.get(), sim)
-                backend.apply(m, kind.get(), strength.get(), sim)
-                status.set("On: %s, %d%%" % (LABELS[kind.get()],
-                                             round(strength.get() * 100)))
+            self.autostart = autostart_enabled()
+        except Exception:
+            self.autostart = False
+        if backend and not backend.supports_simulate:
+            self.settings["mode"] = "correct"
+
+        self.root = tk.Tk()
+        self.root.title(APP)
+        self.root.resizable(False, False)
+        self.root.configure(bg=BG)
+        family = {"Windows": "Segoe UI", "Darwin": "Helvetica Neue"}.get(
+            platform.system(), "DejaVu Sans")
+        self.font = lambda size, bold=False: (family, -size, "bold" if bold else "normal")
+        self.cv = tk.Canvas(self.root, width=self.W, height=self.H, bg=BG,
+                            highlightthickness=0)
+        self.cv.pack()
+        self.cv.bind("<Button-1>", self.on_press)
+        self.cv.bind("<B1-Motion>", self.on_drag)
+        self.cv.bind("<ButtonRelease-1>", self.on_release)
+        self.root.bind("<space>", lambda e: self.toggle())
+        for n, card in enumerate(CARDS):
+            self.root.bind(str(n + 1), lambda e, k=card[0]: self.choose("kind", k))
+        self.root.bind("<Left>", lambda e: self.nudge(-0.05))
+        self.root.bind("<Right>", lambda e: self.nudge(0.05))
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        if platform.system() == "Windows" and backend:
+            try:
+                start_windows_hotkey(self.hotkey)
+                self.root.after(150, self.poll_hotkey)
+            except Exception:
+                pass
+        if backend and self.settings["auto_on"]:
+            self.enabled = True
+            self.apply_now()
+        self.draw()
+        if minimised:
+            self.root.iconify()
+
+    # ---- state -----------------------------------------------------------
+
+    def matrix(self):
+        s = self.settings
+        return build_matrix(s["kind"], s["strength"], s["mode"] == "simulate")
+
+    def apply_now(self):
+        self.job = None
+        if not self.backend:
+            return
+        s = self.settings
+        try:
+            if self.enabled:
+                self.backend.apply(self.matrix(), s["kind"], s["strength"],
+                                   s["mode"] == "simulate")
             else:
-                backend.reset()
-                status.set("Off")
-        except Exception as exc:                       # show, never crash
-            enabled.set(False)
-            status.set("Off")
-            messagebox.showerror(APP, str(exc))
+                self.backend.reset()
+            self.error = None
+        except Exception as exc:
+            self.enabled = False
+            self.error = str(exc)
+        self.draw()
 
-    ttk.Label(frame, text="Colour vision type").grid(sticky="w")
-    for key in ("protan", "deutan", "tritan"):
-        ttk.Radiobutton(frame, text=LABELS[key], value=key, variable=kind,
-                        command=refresh).grid(sticky="w", padx=8)
+    def schedule(self, delay=200):
+        """Debounced, so dragging the slider does not flood the display."""
+        if self.job:
+            self.root.after_cancel(self.job)
+        self.job = self.root.after(delay, self.apply_now)
 
-    ttk.Label(frame, text="Mode").grid(sticky="w", pady=(12, 0))
-    ttk.Radiobutton(frame, text="Correct colours", value="correct",
-                    variable=mode, command=refresh).grid(sticky="w", padx=8)
-    sim_button = ttk.Radiobutton(frame, text="Simulate (show others what I see)",
-                                 value="simulate", variable=mode, command=refresh)
-    sim_button.grid(sticky="w", padx=8)
-    if not backend.supports_simulate:
-        sim_button.state(["disabled"])
+    def toggle(self):
+        if not self.backend:
+            return
+        self.enabled = not self.enabled
+        self.apply_now()
 
-    ttk.Label(frame, text="Strength").grid(sticky="w", pady=(12, 0))
-    scale = ttk.Scale(frame, from_=0.0, to=1.0, variable=strength, length=260)
-    scale.grid(sticky="we")
-    scale.bind("<ButtonRelease-1>", refresh)   # apply when the slider is let go
+    def choose(self, key, value):
+        if key == "mode" and value == "simulate" and self.backend \
+                and not self.backend.supports_simulate:
+            return
+        self.settings[key] = value
+        save_settings(self.settings)
+        self.draw()
+        if self.enabled:
+            self.schedule(0)
 
-    ttk.Checkbutton(frame, text="Enable on every screen", variable=enabled,
-                    command=refresh).grid(sticky="w", pady=(14, 0))
-    ttk.Label(frame, textvariable=status).grid(sticky="w", pady=(6, 0))
-    ttk.Separator(frame).grid(sticky="we", pady=10)
-    ttk.Label(frame, text=backend.name, wraplength=260,
-              foreground="#666").grid(sticky="w")
-    ttk.Label(frame, text=backend.notes, wraplength=260,
-              foreground="#666").grid(sticky="w")
+    def nudge(self, amount):
+        self.set_strength(self.settings["strength"] + amount)
+        save_settings(self.settings)
 
-    def close():
+    def set_strength(self, value):
+        self.settings["strength"] = round(max(0.0, min(1.0, value)), 2)
+        self.draw()
+        if self.enabled:
+            self.schedule()
+
+    def flip(self, key):
+        if key == "autostart":
+            try:
+                set_autostart(not self.autostart)
+                self.autostart = not self.autostart
+            except Exception as exc:
+                self.error = "Could not change start-up: %s" % exc
+        else:
+            self.settings[key] = not self.settings[key]
+            save_settings(self.settings)
+        self.draw()
+
+    def poll_hotkey(self):
+        if self.hotkey["hit"]:
+            self.hotkey["hit"] = False
+            self.toggle()
+        self.root.after(150, self.poll_hotkey)
+
+    def close(self):
         try:
-            backend.reset()
+            if self.backend:
+                self.backend.reset()
         except Exception:
             pass
-        root.destroy()
+        self.root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", close)
-    root.mainloop()
+    # ---- pointer ---------------------------------------------------------
+
+    def on_press(self, event):
+        for x1, y1, x2, y2, action in self.hits:
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                if action == "slider":
+                    self.dragging = True
+                    self.on_drag(event)
+                else:
+                    action()
+                return
+
+    def on_drag(self, event):
+        if self.dragging:
+            x1, x2 = self.slider
+            self.set_strength((event.x - x1) / float(x2 - x1))
+
+    def on_release(self, event):
+        if self.dragging:
+            self.dragging = False
+            save_settings(self.settings)
+
+    # ---- drawing ---------------------------------------------------------
+
+    def rrect(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return self.cv.create_polygon(pts, smooth=True, **kw)
+
+    def tick(self, x, y, colour, size=1.0):
+        self.cv.create_line(x - 5 * size, y, x - 1.5 * size, y + 3.5 * size,
+                            x + 5 * size, y - 4 * size, fill=colour,
+                            width=2.2 * size, capstyle="round", joinstyle="round")
+
+    def status(self):
+        s = self.settings
+        if not self.backend:
+            return "Preview only on this computer"
+        if self.error:
+            return "Could not switch on"
+        if not self.enabled:
+            return "Off. Your screen is showing its normal colours."
+        verb = "Simulating" if s["mode"] == "simulate" else "Correcting for"
+        return "%s %s at %d%%, on every screen." % (
+            verb, LABELS[s["kind"]].lower(), round(s["strength"] * 100))
+
+    def draw(self):
+        cv, s, P, W = self.cv, self.settings, self.PAD, self.W
+        cv.delete("all")
+        self.hits = []
+        text = lambda x, y, t, size=13, bold=False, fill=INK, **kw: cv.create_text(
+            x, y, text=t, font=self.font(size, bold), fill=fill,
+            anchor=kw.pop("anchor", "nw"), **kw)
+
+        # Header and the main switch
+        text(P, 18, APP, 24, True)
+        text(P, 52, self.status(), 13, fill=MUTED, width=W - 2 * P - 100)
+        tx2, ty = W - P, 22
+        on, usable = self.enabled, bool(self.backend)
+        self.rrect(tx2 - 84, ty, tx2, ty + 36, 18,
+                   fill=ACCENT if on else (OFF_TRACK if usable else LINE))
+        kx = tx2 - 18 if on else tx2 - 66
+        cv.create_oval(kx - 13, ty + 5, kx + 13, ty + 31, fill=PANEL, outline="")
+        text(tx2 - 58 if on else tx2 - 26, ty + 18, "On" if on else "Off", 13, True,
+             fill=PANEL if on else (INK if usable else MUTED), anchor="center")
+        self.hits.append((tx2 - 84, ty, tx2, ty + 36, self.toggle))
+
+        # Live preview
+        self.rrect(P, 84, W - P, 214, 14, fill=PANEL)
+        simulate = s["mode"] == "simulate"
+        m = self.matrix()
+        rows = [("Colours as they are", IDENTITY),
+                ("As seen with %s vision" % s["kind"] if simulate
+                 else "With ColourFix on", m)]
+        for r, (label, matrix) in enumerate(rows):
+            y = 96 + r * 58
+            text(P + 16, y, label, 12, fill=MUTED)
+            step = (W - 2 * P - 32 - 36) / 9.0
+            for n, colour in enumerate(SWATCHES):
+                x = P + 16 + n * step
+                self.rrect(x, y + 20, x + 36, y + 48, 6,
+                           fill=preview_hex(colour, matrix))
+
+        # Colour vision type
+        text(P, 232, "Colour vision type", 13, True)
+        cw = (W - 2 * P - 20) / 3.0
+        for n, (key, title, sub) in enumerate(CARDS):
+            x = P + n * (cw + 10)
+            picked = s["kind"] == key
+            self.rrect(x, 256, x + cw, 316, 12, fill=INK if picked else PANEL)
+            text(x + 14, 268, title, 15, True, fill=PANEL if picked else INK)
+            text(x + 14, 290, sub, 12, fill=SOFT if picked else MUTED)
+            if picked:
+                cv.create_oval(x + cw - 32, 266, x + cw - 12, 286,
+                               fill=HILITE, outline="")
+                self.tick(x + cw - 22, 276, INK, 0.8)
+            self.hits.append((x, 256, x + cw, 316,
+                              lambda k=key: self.choose("kind", k)))
+
+        # Mode
+        text(P, 334, "What it should do", 13, True)
+        self.rrect(P, 358, W - P, 396, 12, fill=PANEL)
+        half = (W - 2 * P) / 2.0
+        can_sim = not self.backend or self.backend.supports_simulate
+        for n, (key, label) in enumerate((("correct", "Correct my colours"),
+                                          ("simulate", "Show others what I see"))):
+            x = P + n * half
+            picked = s["mode"] == key
+            if picked:
+                self.rrect(x + 4, 362, x + half - 4, 392, 9, fill=INK)
+            text(x + half / 2, 377, label, 13, picked, anchor="center",
+                 fill=PANEL if picked else (INK if key == "correct" or can_sim
+                                            else OFF_TRACK))
+            self.hits.append((x, 358, x + half, 396,
+                              lambda k=key: self.choose("mode", k)))
+
+        # Strength
+        text(P, 414, "Strength", 13, True)
+        text(W - P, 414, "%d%%" % round(s["strength"] * 100), 13, True, anchor="ne")
+        x1, x2, y = P + 12, W - P - 12, 450
+        self.slider = (x1, x2)
+        kx = x1 + (x2 - x1) * s["strength"]
+        cv.create_line(x1, y, x2, y, fill=LINE, width=6, capstyle="round")
+        cv.create_line(x1, y, kx, y, fill=ACCENT, width=6, capstyle="round")
+        cv.create_oval(kx - 12, y - 12, kx + 12, y + 12, fill=PANEL,
+                       outline=INK, width=2)
+        self.hits.append((P, y - 16, W - P, y + 16, "slider"))
+
+        # Options
+        options = [("auto_on", s["auto_on"], "Switch on as soon as ColourFix opens"),
+                   ("autostart", self.autostart, "Open ColourFix when I log in")]
+        for n, (key, value, label) in enumerate(options):
+            y = 480 + n * 30
+            self.rrect(P, y, P + 20, y + 20, 5, fill=ACCENT if value else PANEL,
+                       outline="" if value else OFF_TRACK)
+            if value:
+                self.tick(P + 10, y + 10, PANEL, 0.8)
+            text(P + 30, y + 10, label, 13, anchor="w")
+            self.hits.append((P, y - 4, W - P, y + 24, lambda k=key: self.flip(k)))
+
+        # Footer
+        cv.create_line(P, 546, W - P, 546, fill=LINE)
+        if self.error or self.backend_error:
+            note = self.error or self.backend_error
+            note = note[0].upper() + note[1:]
+        elif self.hotkey["ready"] or platform.system() == "Windows":
+            note = ("Ctrl+Alt+C switches it on or off from anywhere. Minimise "
+                    "to keep it running; closing this window switches it off.")
+        else:
+            note = ("Space switches it on or off while this window is in "
+                    "front. Closing this window switches it off.")
+        text(P, 556, note, 12, fill=INK if (self.error or self.backend_error)
+             else MUTED, width=W - 2 * P)
+
+    def run(self):
+        self.root.mainloop()
 
 
 # --------------------------------------------------------------------------
@@ -534,35 +906,32 @@ def main():
                    help="simulate the deficiency instead of correcting it")
     p.add_argument("--reset", action="store_true", help="restore normal colours")
     p.add_argument("--selftest", action="store_true", help="check the maths")
+    p.add_argument("--minimised", action="store_true",
+                   help="open the window minimised (used at log-in)")
     args = p.parse_args()
 
     if args.selftest:
         return selftest()
 
+    backend, problem = None, None
     try:
         backend = get_backend()
     except Exception as exc:
-        message = "%s cannot run here: %s" % (APP, exc)
-        if not (args.type or args.reset):      # launched as an app: show it
-            try:
-                import tkinter as tk
-                from tkinter import messagebox
-                tk.Tk().withdraw()
-                messagebox.showerror(APP, message)
-            except Exception:
-                pass
-        sys.exit(message)
+        problem = "%s cannot recolour this screen: %s" % (APP, exc)
 
-    if args.reset:
-        backend.reset()
-        return print("Colours restored.")
-
-    if not args.type:
+    if not (args.type or args.reset):
         try:
-            return run_gui(backend)
+            import tkinter  # noqa: F401
         except ImportError:
             sys.exit("Tkinter is missing. Install it (e.g. 'sudo apt install "
                      "python3-tk') or use --type from the terminal.")
+        return AppWindow(backend, problem, args.minimised).run()
+
+    if not backend:
+        sys.exit(problem)
+    if args.reset:
+        backend.reset()
+        return print("Colours restored.")
 
     m = build_matrix(args.type, args.strength, args.simulate)
     backend.apply(m, args.type, args.strength, args.simulate)
