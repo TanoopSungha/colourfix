@@ -1,0 +1,65 @@
+# Save this file in your repository as:  .github/workflows/build.yml
+#
+# Every push builds ColourFix for Windows, macOS and Linux.
+# Pushing a tag such as v0.1.0 also publishes the builds on the Releases page.
+
+name: Build apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            file: dist/ColourFix.exe
+            label: ColourFix-Windows
+          - os: macos-latest
+            file: dist/ColourFix-macOS.zip
+            label: ColourFix-macOS
+          - os: ubuntu-latest
+            file: dist/ColourFix-Linux
+            label: ColourFix-Linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the colour maths
+        run: python colourfix.py --selftest
+
+      - name: Package
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --windowed --name ColourFix colourfix.py
+
+      - name: Zip the Mac app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/ColourFix.app dist/ColourFix-macOS.zip
+
+      - name: Rename the Linux build
+        if: runner.os == 'Linux'
+        run: mv dist/ColourFix dist/ColourFix-Linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: ${{ matrix.file }}
+
+      - name: Publish on the Releases page
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.file }}
